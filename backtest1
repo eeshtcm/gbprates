@@ -1,0 +1,220 @@
+import numpy as np
+import pandas as pd
+from datetime import date, timedelta
+
+# =========================
+# 0) CONFIG
+# =========================
+BASELINE_REL = -5             # concession baseline (T-5)
+PRE_SIGNAL   = "P2"           # use P2 by default; try "P1" too
+TC_BP        = 1.0            # round-trip costs in bp of the box package
+Q_THRESHOLD  = 0.70           # trade only top 30% |signal|  (set to None if using K_BP)
+K_BP         = None           # alternatively: absolute threshold in bp (e.g., 2.0); if set, ignores Q_THRESHOLD
+YEAR_WINDOW_DAYS = 365        # "last year" window length
+
+# If you don't already have box_perbond on `panel`, we can compute it using pillar ASWs:
+PILLARS_YRS = [2,5,7,10,15,20,30]   # change this if your pillars differ
+PILLAR_COLS = {p: f"asw_{p}y" for p in PILLARS_YRS}  # expected column names
+
+# =========================
+# 1) PER-BOND BOX (if needed)
+# =========================
+def _bracket(m, pillars=PILLARS_YRS):
+    lo = max(p for p in pillars if p <= m)
+    hi = min(p for p in pillars if p >= m)
+    return lo, hi
+
+def _lin_weights(m, L, H):
+    if H == L:
+        return 1.0, 0.0
+    wH = (m - L) / (H - L)
+    wL = 1.0 - wH
+    return wL, wH
+
+def ensure_perbond_box(panel: pd.DataFrame,
+                       tenor_col="tenor_years",
+                       bond_asw_col="asw_bond",
+                       out_col="box_perbond") -> pd.DataFrame:
+    """
+    If `out_col` already exists, returns panel unchanged.
+    Else computes per-bond ASW box = ASW_bond - (weighted pillars), using linear maturity weights.
+    Requires tenor_col, bond_asw_col and pillar ASW columns to be present.
+    """
+    if out_col in panel.columns:
+        return panel
+    missing = [c for c in [tenor_col, bond_asw_col] if c not in panel.columns]
+    missing += [col for col in PILLAR_COLS.values() if col not in panel.columns]
+    if missing:
+        raise ValueError(f"Missing columns to compute per-bond box: {missing}")
+    def _row_box(r):
+        m = float(r[tenor_col])
+        L, H = _bracket(m)
+        wL, wH = _lin_weights(m, L, H)
+        bench = wL * r[PILLAR_COLS[L]] + wH * r[PILLAR_COLS[H]]
+        return r[bond_asw_col] - bench
+    out = panel.copy()
+    out[out_col] = out.apply(_row_box, axis=1)
+    return out
+
+# =========================
+# 2) CONCESSIONS WIDE (P*, T, F*)
+# =========================
+def concessions_wide(panel: pd.DataFrame, metric: str,
+                     baseline_rel: int = BASELINE_REL,
+                     pre_days=(8,7,6,5,4,3,2,1),
+                     fwd_days=(0,1,2,3,4,5),
+                     in_bp=True) -> pd.DataFrame:
+    """
+    Build one row per auction with concession columns:
+    P8..P1 (pre), T (0), F1..F5 (forward), measured vs baseline_rel (e.g., T-5).
+    """
+    p = panel[panel["rel_day"].between(-max(pre_days), max(fwd_days))].copy()
+    # baseline per auction
+    base = (p[p["rel_day"] == baseline_rel]
+              .groupby(["auction_dt","series_id"])[metric]
+              .mean().rename("base"))
+    p = p.merge(base, on=["auction_dt","series_id"], how="inner")
+    p["cons"] = p[metric] - p["base"]
+    if in_bp:
+        p["cons"] = p["cons"] * 100.0
+    # pivot to wide
+    wide = (p.pivot_table(index=["auction_dt","series_id"],
+                          columns="rel_day", values="cons", aggfunc="mean"))
+    # rename columns
+    rename = { -k: f"P{k}" for k in pre_days }
+    rename.update({ 0: "T" })
+    rename.update({ k: f"F{k}" for k in fwd_days if k>0 })
+    wide = wide.rename(columns=rename)
+    # add bucket if available
+    if "bucket" in panel.columns:
+        bmap = panel.drop_duplicates(["auction_dt","series_id"])[["auction_dt","series_id","bucket"]]
+        wide = wide.reset_index().merge(bmap, on=["auction_dt","series_id"], how="left")
+    else:
+        wide = wide.reset_index()
+    return wide
+
+# =========================
+# 3) BACKTEST: Carry-in (enter on P2/P1, exit on T)
+# =========================
+def backtest_carry_in_last_year(wide: pd.DataFrame,
+                                pre_col: str = PRE_SIGNAL,
+                                tc_bp: float = TC_BP,
+                                q_threshold: float | None = Q_THRESHOLD,
+                                k_bp: float | None = K_BP,
+                                as_of: date | None = None,
+                                year_window_days: int = YEAR_WINDOW_DAYS) -> pd.DataFrame:
+    """
+    Event-driven backtest: one potential trade per auction.
+    - Signal = pre_col (e.g., P2 or P1), direction = sign(signal)
+    - Enter at pre_col close, exit at T close (auction day)
+    - Trade only auctions in the last `year_window_days` relative to `as_of`
+    - Gate trades by |signal|: top (1-q_threshold) or absolute >= k_bp
+    - PnL in bp: dir * (T - pre) - tc_bp
+    """
+    assert pre_col in ["P1","P2","P3","P4","P5","P6","P7","P8"], f"Unexpected pre_col: {pre_col}"
+    needed_cols = {pre_col, "T", "auction_dt", "series_id"}
+    missing = needed_cols - set(wide.columns)
+    if missing:
+        raise ValueError(f"wide is missing columns: {missing}")
+
+    w = wide.copy()
+    # date window: last year relative to 'as_of' (default = today)
+    if as_of is None:
+        as_of = pd.Timestamp.today().date()
+    start = as_of - timedelta(days=year_window_days)
+    w["auction_dt"] = pd.to_datetime(w["auction_dt"]).dt.date
+    w = w[(w["auction_dt"] >= start) & (w["auction_dt"] <= as_of)].copy()
+
+    # drop rows missing needed values
+    w = w.dropna(subset=[pre_col, "T"])
+    if w.empty:
+        return pd.DataFrame(columns=["auction_dt","series_id","bucket","signal","dir","entry","exit","pnl_bp"])
+
+    # gating by strength
+    s = w[pre_col].abs()
+    if k_bp is not None:
+        choose = s >= k_bp
+    elif q_threshold is not None:
+        thr = s.quantile(q_threshold)
+        choose = s >= thr
+    else:
+        choose = pd.Series(True, index=w.index)  # no gating
+    w = w.loc[choose].copy()
+    if w.empty:
+        return pd.DataFrame(columns=["auction_dt","series_id","bucket","signal","dir","entry","exit","pnl_bp"])
+
+    # direction and PnL
+    w["signal"] = w[pre_col]
+    w["dir"]    = np.sign(w["signal"]).replace(0, 0.0)  # +1 long box, -1 short box
+    w["entry"]  = w[pre_col]
+    w["exit"]   = w["T"]
+    w["pnl_bp"] = w["dir"] * (w["exit"] - w["entry"]) - tc_bp
+
+    cols = ["auction_dt","series_id","bucket","signal","dir","entry","exit","pnl_bp"]
+    return w[cols].reset_index(drop=True)
+
+# =========================
+# 4) REPORTING HELPERS
+# =========================
+def summarize_trades(trades: pd.DataFrame) -> pd.Series:
+    if trades.empty:
+        return pd.Series({"N":0,"Hit%":np.nan,"Avg bp":np.nan,"Med bp":np.nan,"Total bp":0.0,"Sharpe":np.nan})
+    t = trades.copy()
+    t["win"] = t["pnl_bp"] > 0
+    return pd.Series({
+        "N":         len(t),
+        "Hit%":      100 * t["win"].mean(),
+        "Avg bp":    t["pnl_bp"].mean(),
+        "Med bp":    t["pnl_bp"].median(),
+        "Avg + bp":  t.loc[t["pnl_bp"]>0, "pnl_bp"].mean(),
+        "Avg - bp":  t.loc[t["pnl_bp"]<=0,"pnl_bp"].mean(),
+        "Total bp":  t["pnl_bp"].sum(),
+        "Sharpe":    t["pnl_bp"].mean() / (t["pnl_bp"].std(ddof=1) + 1e-9),
+    })
+
+def by_bucket(trades: pd.DataFrame) -> pd.DataFrame:
+    if trades.empty:
+        return pd.DataFrame(columns=["bucket","N","Hit%","Avg bp","Med bp","Total bp"])
+    g = trades.groupby("bucket")["pnl_bp"]
+    return pd.DataFrame({
+        "N": g.size(),
+        "Hit%": 100 * (trades.groupby("bucket")["pnl_bp"].apply(lambda s: (s>0).mean())),
+        "Avg bp": g.mean(),
+        "Med bp": g.median(),
+        "Total bp": g.sum(),
+    }).reset_index()
+
+# =========================
+# 5) RUN (end-to-end)
+# =========================
+def run_backtest_last_year(panel: pd.DataFrame,
+                           metric_col="box_perbond",
+                           pre_col=PRE_SIGNAL,
+                           baseline_rel=BASELINE_REL,
+                           tc_bp=TC_BP,
+                           q_threshold=Q_THRESHOLD,
+                           k_bp=K_BP,
+                           as_of=None):
+    # Ensure we have the per-bond box
+    pnl_panel = ensure_perbond_box(panel, out_col=metric_col)
+
+    # Build the wide concessions table (P*, T, F*)
+    wide = concessions_wide(pnl_panel, metric=metric_col, baseline_rel=baseline_rel)
+
+    # Backtest: carry-in (enter Pk, exit T) over the last year
+    trades = backtest_carry_in_last_year(
+        wide, pre_col=pre_col, tc_bp=tc_bp,
+        q_threshold=q_threshold, k_bp=k_bp, as_of=as_of
+    )
+    summary = summarize_trades(trades)
+    bucket_tbl = by_bucket(trades)
+    return wide, trades, summary, bucket_tbl
+
+# Example call (uncomment when you have `panel` in memory):
+# wide_box, trades, summary, bucket_tbl = run_backtest_last_year(
+#     panel, metric_col="box_perbond", pre_col="P2", baseline_rel=-5,
+#     tc_bp=1.0, q_threshold=0.70, k_bp=None, as_of=None
+# )
+# print(summary)
+# print(bucket_tbl)
+# trades.head()
