@@ -1,0 +1,1745 @@
+Great prompt. Because you’re only trading the concession into the auction and it’s per bond, you need a box that isolates that bond’s relative value (RV) versus an appropriate benchmark — not a generic 10s2s every time.
+
+Here’s the intuitive rule and a precise way to implement it.
+
+Intuition (what box should you trade?)
+
+For a given auction bond, you want to strip out broad curve moves (level/slope) and measure its sector-relative cheap/rich into T. The cleanest way is:
+
+Per-bond ASW box = Bond’s ASW − (weighted combination of nearby swap pillars’ ASW)
+
+The nearby pillars are the two standard swap maturities that bracket the bond’s maturity at the auction date (e.g., a 9.7y bond is bracketed by 7y and 10y pillars).
+
+The weights are chosen so the benchmark tracks the bond’s curve beta (neutralizing level/slope). Two good choices:
+
+Linear maturity weights (fast & robust)
+
+DV01-matched weights (best practice if you have DV01s)
+
+That residual is the bond-specific box you should trade.
+
+If you already computed a curve-fitted ASW residual (your curve_resid), that is the per-bond ASW box. You can use it directly.
+
+Practical selection rules (what do I do today?)
+Tier 1 — Exact (recommended)
+
+Find bracketing swap pillars for each bond at its auction date:
+
+𝜏
+𝐿
+≤
+bond maturity
+≤
+𝜏
+𝐻
+τ
+L
+	​
+
+≤bond maturity≤τ
+H
+	​
+
+, e.g., {2y, 5y, 7y, 10y, 15y, 20y, 30y}.
+
+Compute weights:
+
+Linear maturity:
+
+𝑤
+𝐻
+=
+𝑀
+−
+𝜏
+𝐿
+𝜏
+𝐻
+−
+𝜏
+𝐿
+,
+  
+𝑤
+𝐿
+=
+1
+−
+𝑤
+𝐻
+w
+H
+	​
+
+=
+τ
+H
+	​
+
+−τ
+L
+	​
+
+M−τ
+L
+	​
+
+	​
+
+,w
+L
+	​
+
+=1−w
+H
+	​
+
+
+DV01-match (if you have par-swap DV01s 
+𝐷
+𝐿
+,
+𝐷
+𝐻
+D
+L
+	​
+
+,D
+H
+	​
+
+): choose 
+𝑤
+𝐿
+,
+𝑤
+𝐻
+w
+L
+	​
+
+,w
+H
+	​
+
+ so 
+𝑤
+𝐿
+𝐷
+𝐿
++
+𝑤
+𝐻
+𝐷
+𝐻
+=
+𝐷
+bond
+w
+L
+	​
+
+D
+L
+	​
+
++w
+H
+	​
+
+D
+H
+	​
+
+=D
+bond
+	​
+
+ and 
+𝑤
+𝐿
++
+𝑤
+𝐻
+=
+1
+w
+L
+	​
+
++w
+H
+	​
+
+=1.
+
+Benchmark ASW = 
+𝑤
+𝐿
+⋅
+ASW
+(
+𝜏
+𝐿
+)
++
+𝑤
+𝐻
+⋅
+ASW
+(
+𝜏
+𝐻
+)
+w
+L
+	​
+
+⋅ASW(τ
+L
+	​
+
+)+w
+H
+	​
+
+⋅ASW(τ
+H
+	​
+
+).
+
+Per-bond box = 
+ASW
+bond
+−
+Benchmark ASW
+ASW
+bond
+	​
+
+−Benchmark ASW.
+
+Trade the concession of that per-bond box into T (carry-in: enter on P2/P1, exit on T).
+
+Tier 2 — Heuristic (when you need a quick map)
+
+Use a simple mapping by tenor bucket:
+
+Short (≤5y): 5s2s (= ASW5 − ASW2)
+
+Belly (≈7–10y): 10s2s (or 10s5s if 2y is noisy)
+
+Long (≥20y): 30s10s
+
+This is coarser (doesn’t adapt per bond), but easy to run as a benchmark.
+
+How to verify you picked the right box (sanity checks)
+
+High beta, small residual: regress 
+ASW
+bond
+ASW
+bond
+	​
+
+ on 
+𝑤
+𝐿
+ASW
+(
+𝜏
+𝐿
+)
++
+𝑤
+𝐻
+ASW
+(
+𝜏
+𝐻
+)
+w
+L
+	​
+
+ASW(τ
+L
+	​
+
+)+w
+H
+	​
+
+ASW(τ
+H
+	​
+
+). You want beta ≈ 1 and small residuals.
+
+Correlation: the bond ASW should correlate strongly with the benchmark (>0.9 typical); your box (residual) should be low-vol and mean-reverting.
+
+Stability: weights don’t flail around when you roll day to day.
+
+If these fail, widen the bracket (e.g., use 5y & 10y instead of 7y & 10y) or use a 3-pillar fit (neutralize curvature too).
+
+How to wire this into your existing notebook
+
+Assume you have:
+
+panel: one row per (auction × date) with date, auction_dt, series_id, tenor_years (or maturity date), and bond ASW (say asw_bond).
+
+pillars: daily ASW for standard swap maturities, columns like asw_2y, asw_5y, asw_7y, asw_10y, asw_15y, asw_20y, asw_30y.
+
+A) Build the per-bond benchmark and box
+PILLARS = [2,5,7,10,15,20,30]  # in years
+
+def bracket(m):
+    # find lower/upper pillars around maturity m
+    lower = max([p for p in PILLARS if p <= m])
+    upper = min([p for p in PILLARS if p >= m])
+    return lower, upper
+
+def linear_weights(m, L, H):
+    if H == L:
+        return 0.0, 1.0  # exact pillar
+    wH = (m - L) / (H - L)
+    wL = 1.0 - wH
+    return wL, wH
+
+# suppose `panel` has `tenor_years` for the bond at the auction date
+# and you've merged daily pillar ASWs into it by `date`:
+# e.g., panel has columns: ['asw_bond','asw_2y','asw_5y','asw_7y','asw_10y','asw_15y','asw_20y','asw_30y']
+
+def compute_perbond_box(row):
+    m = float(row["tenor_years"])
+    L, H = bracket(m)
+    wL, wH = linear_weights(m, L, H)
+    bench = wL * row[f"asw_{L}y"] + wH * row[f"asw_{H}y"]
+    return row["asw_bond"] - bench
+
+panel = panel.copy()
+panel["box_perbond"] = panel.apply(compute_perbond_box, axis=1)
+
+
+(If you have DV01s for swap pillars and the bond, swap in DV01-matched weights.)
+
+B) Turn the box into concession into T and trade carry-in
+
+You’ve already built these utilities — just point them at box_perbond.
+
+# Concession vs T-5 for the per-bond box
+cons_box = make_concession_panel(panel, metric="box_perbond", baseline_rel=-5, window=(-10,10))
+wide_box = concessions_wide(panel, metric="box_perbond")  # gives P*, T in bp per auction
+
+# Carry-in strategy: ride pre-auction move into T
+carry_p2 = backtest_carry_in(wide_box, pre="P2", tc_bp=1.0)  # enter at P2, exit at T
+carry_p1 = backtest_carry_in(wide_box, pre="P1", tc_bp=1.0)  # enter at P1, exit at T
+
+print(summarize_trades(carry_p2))
+print(summarize_trades(carry_p1))
+
+
+Direction for carry-in: dir = sign(Pk).
+
+If P2 > 0 (box widened into the sale), you short the box and cover at T.
+
+If P2 < 0 (box tightened), you long the box and unwind at T.
+
+You can require a threshold (e.g., |P2| ≥ 2–3 bp or top 30%) to avoid noise.
+
+What to say in your presentation
+
+“Because we trade only the concession into the auction and do it per bond, our RV measure is a per-bond ASW box: the bond’s ASW minus a DV01-matched (or linearly weighted) combination of nearby swap pillars. This neutralizes level and slope so we’re measuring bond-specific cheap/rich into T.”
+
+“We compute concession as the change in that per-bond box versus T−5, then run a carry-in trade: if the box is widening into the auction (P1/P2 > 0) we short the box and close at T; if it’s tightening (P1/P2 < 0) we go long and exit at T. P&L is the box change from entry to T, minus costs.”
+
+“We also show a heuristic mapping (5s2s / 10s2s / 30s10s) as a benchmark and verify our exact per-bond box with beta≈1, high correlation, and stable residuals.”
+
+Pitfalls & tips
+
+Green vs conventional: spreads can behave differently; segment if needed.
+
+Repo specialness: specials can distort per-bond ASW; tag/segment if available.
+
+Auction type: new line vs reopening; on-the-run vs off-the-run — behavior can differ.
+
+Data gaps: if T−5 is missing, use a fallback baseline (last available <0) and flag in robustness.
+
+If you tell me what ASW pillars you have in your file (exact column names), I can drop in the precise code to merge them and compute the per-bond box you’ll trade.
+
+You said:
+so whats the signal now 
+ChatGPT said:
+Thought for 42s
+
+Great question. Since you’re only trading the concession into the auction and doing it per bond, the signal should be the per-bond ASW-box concession before T (not the raw level, and not a generic 10s2s).
+
+The signal (default)
+
+For auction 
+𝑖
+i, define the per-bond ASW box as:
+
+BOX
+(
+𝑖
+)
+(
+𝑡
+)
+=
+ASW
+bond
+(
+𝑡
+)
+−
+[
+𝑤
+𝐿
+ 
+ASW
+(
+𝜏
+𝐿
+,
+𝑡
+)
++
+𝑤
+𝐻
+ 
+ASW
+(
+𝜏
+𝐻
+,
+𝑡
+)
+]
+,
+BOX
+(i)
+(t)=ASW
+bond
+	​
+
+(t)−[w
+L
+	​
+
+ASW(τ
+L
+	​
+
+,t)+w
+H
+	​
+
+ASW(τ
+H
+	​
+
+,t)],
+
+where 
+𝜏
+𝐿
+,
+𝜏
+𝐻
+τ
+L
+	​
+
+,τ
+H
+	​
+
+ are the swap pillars that bracket the bond’s maturity; 
+𝑤
+𝐿
+,
+𝑤
+𝐻
+w
+L
+	​
+
+,w
+H
+	​
+
+ are linear-maturity (or DV01-matched) weights.
+
+Pick a pre-auction baseline (usually T−5). Your carry-in signal is then one of:
+
+Primary: 
+𝑆
+𝑖
+=
+BOX
+(
+𝑖
+)
+(
+𝑇
+−
+2
+)
+−
+BOX
+(
+𝑖
+)
+(
+𝑇
+−
+5
+)
+S
+i
+	​
+
+=BOX
+(i)
+(T−2)−BOX
+(i)
+(T−5) (P2 concession)
+
+Alternative: 
+𝑆
+𝑖
+=
+BOX
+(
+𝑖
+)
+(
+𝑇
+−
+1
+)
+−
+BOX
+(
+𝑖
+)
+(
+𝑇
+−
+5
+)
+S
+i
+	​
+
+=BOX
+(i)
+(T−1)−BOX
+(i)
+(T−5) (P1 concession)
+
+Robust combo: 
+𝑆
+𝑖
+=
+0.4
+⋅
+𝑃
+2
++
+0.6
+⋅
+𝑃
+1
+S
+i
+	​
+
+=0.4⋅P2+0.6⋅P1 (smooths noise)
+
+Z-score option: 
+𝑆
+𝑖
+=
+𝑃
+2
+𝜎
+pre
+S
+i
+	​
+
+=
+σ
+pre
+	​
+
+P2
+	​
+
+ where 
+𝜎
+pre
+σ
+pre
+	​
+
+ is stdev of BOX over 
+[
+−
+10
+,
+−
+1
+]
+[−10,−1] trading days.
+
+Direction, entry, exit
+
+Direction: 
+dir
+=
+sign
+(
+𝑆
+𝑖
+)
+dir=sign(S
+i
+	​
+
+)
+
+If 
+𝑆
+𝑖
+>
+0
+S
+i
+	​
+
+>0: box already widening into T ⇒ short box (benefit if it widens further into T).
+
+If 
+𝑆
+𝑖
+<
+0
+S
+i
+	​
+
+<0: box tightening ⇒ long box.
+
+Entry: at the same pre day the signal is measured (P2 or P1 close).
+
+Exit: at T (auction-day close).
+
+Gate: trade only if 
+∣
+𝑆
+𝑖
+∣
+∣S
+i
+	​
+
+∣ is large (top 30% or 
+≥
+≥ 2–3 bp).
+
+P&L (bp of box; subtract round-trip cost 
+𝑐
+c)
+
+Let 
+𝐸
+=
+BOX
+(
+𝑖
+)
+(
+entry
+)
+−
+BOX
+(
+𝑖
+)
+(
+T−5
+)
+E=BOX
+(i)
+(entry)−BOX
+(i)
+(T−5) and 
+𝑋
+=
+BOX
+(
+𝑖
+)
+(
+T
+)
+−
+BOX
+(
+𝑖
+)
+(
+T−5
+)
+X=BOX
+(i)
+(T)−BOX
+(i)
+(T−5).
+
+pnl_bp
+=
+dir
+⋅
+(
+𝑋
+−
+𝐸
+)
+−
+𝑐
+.
+pnl_bp=dir⋅(X−E)−c.
+
+If 
+𝑆
+𝑖
+=
+𝑃
+2
+>
+0
+S
+i
+	​
+
+=P2>0 (we short), and BOX keeps widening into T, 
+𝑋
+−
+𝐸
+>
+0
+X−E>0 ⇒ positive P&L (after costs).
+
+Why this is the right signal
+
+It’s per bond (uses that bond’s ASW minus its own pillar benchmark).
+
+It targets concession into T (P2/P1 vs T−5), not post-auction moves.
+
+It’s directional in the box, not the broad curve (level/slope neutralized by the benchmark).
+
+What to say on the slide
+
+“Signal = pre-auction per-bond ASW-box concession (P2/P1 vs T−5). Direction = sign(signal). Enter on P2/P1 close, exit on T. Trade only when 
+∣
+signal
+∣
+∣signal∣ is large. P&L is the change in the per-bond box from entry to T, in bp, minus costs.”
+
+If you want, I can turn this into two lines of code using your concessions_wide(panel, metric="box_perbond") table (columns P2, P1, T) with the exact filters you prefer.
+
+You said:
+write all the code to backtest this strategy over the last year and explain how the backtest works exactly, since we dont enter the strategy every day
+ChatGPT said:
+Thought for 31s
+
+Awesome — here’s a self-contained, drop-in backtest for your per-bond ASW-box “carry-in” strategy over the last year, plus a plain-English explanation of exactly how it works.
+
+✅ What this code expects
+
+A DataFrame called panel: one row per (auction × trading day) around each auction, with at least:
+
+auction_dt (date), date (trading date), series_id (bond line), rel_day (…−10…0…+10…)
+
+Either:
+
+box_perbond (the per-bond ASW box you want to trade), or
+
+asw_bond and pillar ASWs named asw_2y, asw_5y, asw_7y, asw_10y, asw_15y, asw_20y, asw_30y
+
+You can change pillar names/sets if yours differ.
+
+🧩 The backtest code (copy-paste as one cell)
+import numpy as np
+import pandas as pd
+from datetime import date, timedelta
+
+# =========================
+# 0) CONFIG
+# =========================
+BASELINE_REL = -5             # concession baseline (T-5)
+PRE_SIGNAL   = "P2"           # use P2 by default; try "P1" too
+TC_BP        = 1.0            # round-trip costs in bp of the box package
+Q_THRESHOLD  = 0.70           # trade only top 30% |signal|  (set to None if using K_BP)
+K_BP         = None           # alternatively: absolute threshold in bp (e.g., 2.0); if set, ignores Q_THRESHOLD
+YEAR_WINDOW_DAYS = 365        # "last year" window length
+
+# If you don't already have box_perbond on `panel`, we can compute it using pillar ASWs:
+PILLARS_YRS = [2,5,7,10,15,20,30]   # change this if your pillars differ
+PILLAR_COLS = {p: f"asw_{p}y" for p in PILLARS_YRS}  # expected column names
+
+# =========================
+# 1) PER-BOND BOX (if needed)
+# =========================
+def _bracket(m, pillars=PILLARS_YRS):
+    lo = max(p for p in pillars if p <= m)
+    hi = min(p for p in pillars if p >= m)
+    return lo, hi
+
+def _lin_weights(m, L, H):
+    if H == L:
+        return 1.0, 0.0
+    wH = (m - L) / (H - L)
+    wL = 1.0 - wH
+    return wL, wH
+
+def ensure_perbond_box(panel: pd.DataFrame,
+                       tenor_col="tenor_years",
+                       bond_asw_col="asw_bond",
+                       out_col="box_perbond") -> pd.DataFrame:
+    """
+    If `out_col` already exists, returns panel unchanged.
+    Else computes per-bond ASW box = ASW_bond - (weighted pillars), using linear maturity weights.
+    Requires tenor_col, bond_asw_col and pillar ASW columns to be present.
+    """
+    if out_col in panel.columns:
+        return panel
+    missing = [c for c in [tenor_col, bond_asw_col] if c not in panel.columns]
+    missing += [col for col in PILLAR_COLS.values() if col not in panel.columns]
+    if missing:
+        raise ValueError(f"Missing columns to compute per-bond box: {missing}")
+    def _row_box(r):
+        m = float(r[tenor_col])
+        L, H = _bracket(m)
+        wL, wH = _lin_weights(m, L, H)
+        bench = wL * r[PILLAR_COLS[L]] + wH * r[PILLAR_COLS[H]]
+        return r[bond_asw_col] - bench
+    out = panel.copy()
+    out[out_col] = out.apply(_row_box, axis=1)
+    return out
+
+# =========================
+# 2) CONCESSIONS WIDE (P*, T, F*)
+# =========================
+def concessions_wide(panel: pd.DataFrame, metric: str,
+                     baseline_rel: int = BASELINE_REL,
+                     pre_days=(8,7,6,5,4,3,2,1),
+                     fwd_days=(0,1,2,3,4,5),
+                     in_bp=True) -> pd.DataFrame:
+    """
+    Build one row per auction with concession columns:
+    P8..P1 (pre), T (0), F1..F5 (forward), measured vs baseline_rel (e.g., T-5).
+    """
+    p = panel[panel["rel_day"].between(-max(pre_days), max(fwd_days))].copy()
+    # baseline per auction
+    base = (p[p["rel_day"] == baseline_rel]
+              .groupby(["auction_dt","series_id"])[metric]
+              .mean().rename("base"))
+    p = p.merge(base, on=["auction_dt","series_id"], how="inner")
+    p["cons"] = p[metric] - p["base"]
+    if in_bp:
+        p["cons"] = p["cons"] * 100.0
+    # pivot to wide
+    wide = (p.pivot_table(index=["auction_dt","series_id"],
+                          columns="rel_day", values="cons", aggfunc="mean"))
+    # rename columns
+    rename = { -k: f"P{k}" for k in pre_days }
+    rename.update({ 0: "T" })
+    rename.update({ k: f"F{k}" for k in fwd_days if k>0 })
+    wide = wide.rename(columns=rename)
+    # add bucket if available
+    if "bucket" in panel.columns:
+        bmap = panel.drop_duplicates(["auction_dt","series_id"])[["auction_dt","series_id","bucket"]]
+        wide = wide.reset_index().merge(bmap, on=["auction_dt","series_id"], how="left")
+    else:
+        wide = wide.reset_index()
+    return wide
+
+# =========================
+# 3) BACKTEST: Carry-in (enter on P2/P1, exit on T)
+# =========================
+def backtest_carry_in_last_year(wide: pd.DataFrame,
+                                pre_col: str = PRE_SIGNAL,
+                                tc_bp: float = TC_BP,
+                                q_threshold: float | None = Q_THRESHOLD,
+                                k_bp: float | None = K_BP,
+                                as_of: date | None = None,
+                                year_window_days: int = YEAR_WINDOW_DAYS) -> pd.DataFrame:
+    """
+    Event-driven backtest: one potential trade per auction.
+    - Signal = pre_col (e.g., P2 or P1), direction = sign(signal)
+    - Enter at pre_col close, exit at T close (auction day)
+    - Trade only auctions in the last `year_window_days` relative to `as_of`
+    - Gate trades by |signal|: top (1-q_threshold) or absolute >= k_bp
+    - PnL in bp: dir * (T - pre) - tc_bp
+    """
+    assert pre_col in ["P1","P2","P3","P4","P5","P6","P7","P8"], f"Unexpected pre_col: {pre_col}"
+    needed_cols = {pre_col, "T", "auction_dt", "series_id"}
+    missing = needed_cols - set(wide.columns)
+    if missing:
+        raise ValueError(f"wide is missing columns: {missing}")
+
+    w = wide.copy()
+    # date window: last year relative to 'as_of' (default = today)
+    if as_of is None:
+        as_of = pd.Timestamp.today().date()
+    start = as_of - timedelta(days=year_window_days)
+    w["auction_dt"] = pd.to_datetime(w["auction_dt"]).dt.date
+    w = w[(w["auction_dt"] >= start) & (w["auction_dt"] <= as_of)].copy()
+
+    # drop rows missing needed values
+    w = w.dropna(subset=[pre_col, "T"])
+    if w.empty:
+        return pd.DataFrame(columns=["auction_dt","series_id","bucket","signal","dir","entry","exit","pnl_bp"])
+
+    # gating by strength
+    s = w[pre_col].abs()
+    if k_bp is not None:
+        choose = s >= k_bp
+    elif q_threshold is not None:
+        thr = s.quantile(q_threshold)
+        choose = s >= thr
+    else:
+        choose = pd.Series(True, index=w.index)  # no gating
+    w = w.loc[choose].copy()
+    if w.empty:
+        return pd.DataFrame(columns=["auction_dt","series_id","bucket","signal","dir","entry","exit","pnl_bp"])
+
+    # direction and PnL
+    w["signal"] = w[pre_col]
+    w["dir"]    = np.sign(w["signal"]).replace(0, 0.0)  # +1 long box, -1 short box
+    w["entry"]  = w[pre_col]
+    w["exit"]   = w["T"]
+    w["pnl_bp"] = w["dir"] * (w["exit"] - w["entry"]) - tc_bp
+
+    cols = ["auction_dt","series_id","bucket","signal","dir","entry","exit","pnl_bp"]
+    return w[cols].reset_index(drop=True)
+
+# =========================
+# 4) REPORTING HELPERS
+# =========================
+def summarize_trades(trades: pd.DataFrame) -> pd.Series:
+    if trades.empty:
+        return pd.Series({"N":0,"Hit%":np.nan,"Avg bp":np.nan,"Med bp":np.nan,"Total bp":0.0,"Sharpe":np.nan})
+    t = trades.copy()
+    t["win"] = t["pnl_bp"] > 0
+    return pd.Series({
+        "N":         len(t),
+        "Hit%":      100 * t["win"].mean(),
+        "Avg bp":    t["pnl_bp"].mean(),
+        "Med bp":    t["pnl_bp"].median(),
+        "Avg + bp":  t.loc[t["pnl_bp"]>0, "pnl_bp"].mean(),
+        "Avg - bp":  t.loc[t["pnl_bp"]<=0,"pnl_bp"].mean(),
+        "Total bp":  t["pnl_bp"].sum(),
+        "Sharpe":    t["pnl_bp"].mean() / (t["pnl_bp"].std(ddof=1) + 1e-9),
+    })
+
+def by_bucket(trades: pd.DataFrame) -> pd.DataFrame:
+    if trades.empty:
+        return pd.DataFrame(columns=["bucket","N","Hit%","Avg bp","Med bp","Total bp"])
+    g = trades.groupby("bucket")["pnl_bp"]
+    return pd.DataFrame({
+        "N": g.size(),
+        "Hit%": 100 * (trades.groupby("bucket")["pnl_bp"].apply(lambda s: (s>0).mean())),
+        "Avg bp": g.mean(),
+        "Med bp": g.median(),
+        "Total bp": g.sum(),
+    }).reset_index()
+
+# =========================
+# 5) RUN (end-to-end)
+# =========================
+def run_backtest_last_year(panel: pd.DataFrame,
+                           metric_col="box_perbond",
+                           pre_col=PRE_SIGNAL,
+                           baseline_rel=BASELINE_REL,
+                           tc_bp=TC_BP,
+                           q_threshold=Q_THRESHOLD,
+                           k_bp=K_BP,
+                           as_of=None):
+    # Ensure we have the per-bond box
+    pnl_panel = ensure_perbond_box(panel, out_col=metric_col)
+
+    # Build the wide concessions table (P*, T, F*)
+    wide = concessions_wide(pnl_panel, metric=metric_col, baseline_rel=baseline_rel)
+
+    # Backtest: carry-in (enter Pk, exit T) over the last year
+    trades = backtest_carry_in_last_year(
+        wide, pre_col=pre_col, tc_bp=tc_bp,
+        q_threshold=q_threshold, k_bp=k_bp, as_of=as_of
+    )
+    summary = summarize_trades(trades)
+    bucket_tbl = by_bucket(trades)
+    return wide, trades, summary, bucket_tbl
+
+# Example call (uncomment when you have `panel` in memory):
+# wide_box, trades, summary, bucket_tbl = run_backtest_last_year(
+#     panel, metric_col="box_perbond", pre_col="P2", baseline_rel=-5,
+#     tc_bp=1.0, q_threshold=0.70, k_bp=None, as_of=None
+# )
+# print(summary)
+# print(bucket_tbl)
+# trades.head()
+
+🗺️ What the backtest is doing (step-by-step)
+
+Per-bond box (RV measure).
+If you don’t already have box_perbond, we compute it per row as:
+
+ASW
+bond
+−
+[
+𝑤
+𝐿
+⋅
+ASW
+(
+𝜏
+𝐿
+)
++
+𝑤
+𝐻
+⋅
+ASW
+(
+𝜏
+𝐻
+)
+]
+ASW
+bond
+	​
+
+−[w
+L
+	​
+
+⋅ASW(τ
+L
+	​
+
+)+w
+H
+	​
+
+⋅ASW(τ
+H
+	​
+
+)]
+
+where 
+𝜏
+𝐿
+,
+𝜏
+𝐻
+τ
+L
+	​
+
+,τ
+H
+	​
+
+ are the two swap pillars that bracket the bond’s maturity at the auction, and 
+𝑤
+𝐿
+,
+𝑤
+𝐻
+w
+L
+	​
+
+,w
+H
+	​
+
+ are linear-maturity weights.
+This neutralises level/slope and isolates the bond’s own richness/cheapness.
+
+Turn levels into concession (event-time).
+For each auction 
+𝑖
+i, we compute the concession of the per-bond box at each relative trading day 
+𝑟
+r:
+
+cons
+(
+𝑟
+)
+=
+BOX
+(
+𝑟
+)
+−
+BOX
+(
+𝑇
+−
+5
+)
+cons(r)=BOX(r)−BOX(T−5)
+
+This gives a wide one-row-per-auction table with P8..P1 (pre), T, and F1..F5 (post), in bp.
+
+Only last year.
+We keep auctions whose auction_dt is within the last 365 days (relative to today, or a supplied as_of date).
+
+Signal & entry/exit (we do not trade every day).
+
+Signal = P2 (default; or P1).
+
+Direction = sign(signal):
+
+If the per-bond box widened by P2>0, we short the box.
+
+If it tightened (P2<0), we long the box.
+
+Entry = at P2 (or P1) close — i.e., 2 (or 1) trading days before the auction.
+
+Exit = at T (auction-day close).
+This is event-driven: there’s at most one trade per auction, only if the signal is strong enough (below).
+
+We trade only when the signal is meaningful.
+We require 
+∣
+signal
+∣
+∣signal∣ to be:
+
+In the top 30% by absolute magnitude (configurable), or
+
+Above an absolute threshold (e.g., ≥ 2 bp).
+This avoids noise and turnover.
+
+P&L in basis points (minus costs).
+For each traded auction:
+
+PnL
+bp
+=
+dir
+×
+(
+𝑇
+−
+entry
+)
+  
+−
+  
+TC_BP
+PnL
+bp
+	​
+
+=dir×(T−entry)−TC_BP
+
+If P2>0 and we short, we win if the box widens further into T (T−P2 > 0)?
+Careful: a “carry-in” trade is riding the pre-move into T, not fading it.
+
+Short on P2>0: profit if the box at T is even wider than at P2 (T > P2).
+
+Long on P2<0: profit if the box at T is even tighter than at P2 (T < P2).
+We subtract an all-in round-trip cost TC_BP to reflect execution costs.
+
+Summaries you’ll show.
+
+Overall: N, Hit%, Avg/Med PnL (bp), Total (bp), Sharpe.
+
+By bucket: same stats per tenor bucket.
+(You can also add histograms/cum-PnL plots if you like.)
+
+🧠 Why we “don’t enter every day”
+
+This strategy is event-driven: a trade only exists when there’s an auction for a given bond line.
+
+For each auction we may enter at P2 (or P1) and exit at T. On all other days there’s no trade, so the backtest naturally has sparse entries (one per qualifying auction), not daily positions.
+
+🔧 What to tweak quickly
+
+Baseline: change BASELINE_REL to -1 for a “day-before” definition.
+
+Signal choice: use "P1" instead of "P2" (or test both).
+
+Gating: switch from Q_THRESHOLD to {K_BP = 2.0} for an absolute bp cutoff.
+
+Costs: stress TC_BP (e.g., 0.8 → 2.0 bp).
+
+Window: change YEAR_WINDOW_DAYS if your “last year” should be trading-days not calendar days.
+
+If you paste a small sample of your panel.head() (column names only are fine), I can tailor the pillar names/tenor column and set a default that runs on your exact schema.
+
+You said:
+so should i change my x axis of the backtest
+ChatGPT said:
+Thought for 43s
+
+Short answer: yes—use calendar time for the backtest plots, not event‐time.
+Event-time (rel_day = −10…+10) is perfect for the analysis (concession profiles), but a backtest should show performance when it actually happens in real time. Because you only trade around auctions (not every day), your equity curve will be step-like with gaps—this is expected.
+
+Below are two sensible x-axes you can use, plus drop-in code for each.
+
+Option A — Cumulative P&L by exit (auction) date (simple, standard)
+
+One row = one trade (enter on P2/P1, exit on T).
+
+Allocate each trade’s P&L to its exit date (when it’s realized).
+
+X-axis = exit_date (i.e., auction_dt).
+
+Result: step-function equity curve over the last year; no fake interpolation on days you weren’t trading.
+
+# assumes you already have:
+# trades: from backtest_carry_in_last_year(...), with columns ['auction_dt','series_id','pnl_bp', ...]
+# panel:  event panel with ['auction_dt','series_id','date','rel_day'] so we can fetch entry dates
+
+def attach_trade_dates(trades, panel, pre_col="P2"):
+    entry_rel = -2 if pre_col == "P2" else -1
+    dates = panel[panel["rel_day"].isin([entry_rel, 0])][["auction_dt","series_id","rel_day","date"]]
+    pivot = (dates.pivot_table(index=["auction_dt","series_id"],
+                               columns="rel_day", values="date", aggfunc="first")
+                  .rename(columns={entry_rel:"entry_date", 0:"exit_date"})
+                  .reset_index())
+    return trades.merge(pivot, on=["auction_dt","series_id"], how="left")
+
+# build dated trades and an equity curve (calendar time)
+dated_trades = attach_trade_dates(trades, panel, pre_col="P2")
+eq = (dated_trades.sort_values("exit_date")
+                  .assign(cum_pnl_bp=lambda d: d["pnl_bp"].cumsum())
+                  [["exit_date","cum_pnl_bp"]])
+
+# (plot) x-axis = exit_date; y-axis = cumulative P&L (bp)
+# plt.figure(...); plt.step(eq["exit_date"], eq["cum_pnl_bp"], where="post"); ...
+
+
+When to show: headline equity curve, bucket-segmented curves (filter dated_trades by bucket then repeat).
+
+Option B — Daily mark-to-market equity curve (optional, more granular)
+
+If you want to display drawdowns during the holding period (P2→T or P1→T), you can build a daily P&L series by allocating each trade’s P&L on its exit day only (simple) or, more precisely, by MTM the box within the holding window and summing across trades.
+
+Given carry-in trades last 1–2 days, the exit-day allocation is usually enough. If you insist on MTM:
+
+def daily_equity_exit_allocation(dated_trades):
+    # allocate the whole trade P&L to its exit date (clean step series)
+    daily = (dated_trades.groupby("exit_date")["pnl_bp"].sum()
+                        .sort_index()
+                        .rename("pnl_bp")
+                        .to_frame())
+    daily["cum_pnl_bp"] = daily["pnl_bp"].cumsum()
+    return daily.reset_index()
+
+daily_curve = daily_equity_exit_allocation(dated_trades)
+# Plot: x = date, y = cum_pnl_bp (will be flat between exits)
+
+
+If you really want in-window MTM, you can reconstruct daily box changes from panel["box_perbond"] between entry_date and exit_date, multiply by dir, and subtract costs on entry. For carry-in (1–2 days), this rarely changes the story.
+
+How to explain this in your presentation
+
+“For event-study plots we use trading-day event time (rel_day) to show average concession.
+For the backtest, we switch to calendar time because trades only occur around auctions. We therefore plot cumulative P&L by exit (auction) date; the equity curve is step-like (no positions on most days).”
+
+“Each trade’s P&L is computed from entry at P2/P1 to exit at T, in bp of the per-bond ASW box, minus a round-trip cost. We then sort trades by exit date and cumulate to get the equity curve. Optionally, we can build a daily MTM series, but for 1–2-day holds, exit-day allocation is sufficient and cleaner.”
+
+Quick checklist
+
+✅ Event-study charts: keep x-axis = rel_day.
+
+✅ Backtest equity curve: x-axis = calendar date (prefer exit/auction date).
+
+✅ Don’t fabricate daily points when you’re not in a trade; a step line is expected.
+
+✅ If stakeholders want intra-window swings, add the optional daily MTM.
+
+If you want, share your current equity plot and I’ll tweak it to use exit dates and a step style so it reads cleanly.
+
+You said:
+what if its over 8 day window around auction date
+ChatGPT said:
+Thought for 43s
+
+Great question — once you extend the pre-auction window to 8 trading days you have to be careful not to peek into the future when forming the signal on the early days (P−8, P−7, P−6). Here’s how to do it cleanly, plus drop-in code.
+
+The core issue
+
+Your earlier signal used concession vs T−5.
+
+That’s fine for entries at P−2 / P−1, because T−5 is already known then.
+
+But if you want to enter as early as P−8, using “vs T−5” is look-ahead (T−5 happens after P−8).
+
+Fix: within the 8-day window 
+[
+−
+8
+,
+−
+1
+]
+[−8,−1], compute a past-only signal at each day 
+𝑟
+r using only information up to that day. Two safe choices:
+
+Rolling difference:
+
+𝑆
+(
+𝑟
+)
+=
+BOX
+(
+𝑟
+)
+−
+mean
+(
+BOX
+(
+ℓ
+)
+:
+ℓ
+∈
+[
+𝑟
+−
+𝑚
+,
+ 
+𝑟
+−
+1
+]
+)
+S(r)=BOX(r)−mean(BOX(ℓ):ℓ∈[r−m,r−1])
+(use 
+𝑚
+=
+3
+m=3–5; requires at least min_past prints).
+
+Rolling z-score:
+
+𝑍
+(
+𝑟
+)
+=
+BOX
+(
+𝑟
+)
+−
+𝜇
+𝑟
+−
+1
+𝜎
+𝑟
+−
+1
+Z(r)=
+σ
+r−1
+	​
+
+BOX(r)−μ
+r−1
+	​
+
+	​
+
+ with 
+𝜇
+,
+𝜎
+μ,σ from the same past window.
+
+Then use a first-touch rule: enter on the earliest day in 
+[
+−
+8
+,
+−
+1
+]
+[−8,−1] where the (absolute) signal crosses your threshold; exit at T.
+
+What we’ll backtest now
+
+Instrument: the per-bond ASW box (box_perbond) you defined (bond ASW − weighted pillar ASW).
+
+Window: scan P−8 … P−1.
+
+Signal: rolling diff vs the past mean (bp); (I also note how to flip to z-score).
+
+Entry: first day in the window where 
+∣
+𝑆
+(
+𝑟
+)
+∣
+≥
+𝑘
+bp
+∣S(r)∣≥k
+bp
+	​
+
+ and there are at least min_past prior prints.
+
+Direction: 
+dir
+=
+sign
+(
+𝑆
+(
+𝑟
+)
+)
+dir=sign(S(r)) (if box is widening vs its own recent past, short the box; if tightening, long).
+
+Exit: T (auction-day close).
+
+PnL (bp): 
+dir
+⋅
+(
+BOX
+(
+𝑇
+)
+−
+BOX
+(
+𝑟
+)
+)
+−
+cost
+dir⋅(BOX(T)−BOX(r))−cost.
+
+This way, you can truly use an 8-day pre window with no look-ahead.
+
+Drop-in code (event-driven, last 1y, first-touch in [-8,-1])
+import numpy as np
+import pandas as pd
+from datetime import date, timedelta
+
+# ------------ config ------------
+PRE_WINDOW_DAYS = 8       # scan P-8 ... P-1
+MIN_PAST = 3              # require >= MIN_PAST prior prints to form past-only signal
+ROLL_LEN = 5              # lookback length for past mean / std (use the last up-to 5 prior prints)
+K_BP = 2.0                # absolute threshold (bp) for first-touch gate (tune this)
+USE_ZSCORE = False        # if True, gate on z-score instead of bp
+TC_BP = 1.0               # round-trip cost (bp of the box)
+YEAR_WINDOW_DAYS = 365    # backtest horizon
+METRIC_COL = "box_perbond" # level series you trade; one row per (auction x date) in `panel`
+
+def backtest_first_touch_pre_window(panel: pd.DataFrame,
+                                    metric_col: str = METRIC_COL,
+                                    pre_window_days: int = PRE_WINDOW_DAYS,
+                                    min_past: int = MIN_PAST,
+                                    roll_len: int = ROLL_LEN,
+                                    k_bp: float = K_BP,
+                                    use_zscore: bool = USE_ZSCORE,
+                                    tc_bp: float = TC_BP,
+                                    as_of: date | None = None,
+                                    year_window_days: int = YEAR_WINDOW_DAYS) -> pd.DataFrame:
+    """
+    Event-driven backtest over last year:
+      - For each auction (auction_dt, series_id), scan rel_day r in [-pre_window_days, -1]
+      - At each r, compute past-only signal using prior prints in [r-roll_len, r-1]
+      - First-touch rule: enter at earliest r where |signal| >= threshold
+      - Exit at T (rel_day=0). PnL in bp minus costs.
+
+    Expects `panel` with columns:
+      ['auction_dt','series_id','date','rel_day', metric_col] and at least rel_day in [-pre_window_days..0].
+    """
+    assert all(c in panel.columns for c in ["auction_dt","series_id","date","rel_day",metric_col]), "Panel missing columns."
+
+    df = panel.copy()
+    df["auction_dt"] = pd.to_datetime(df["auction_dt"]).dt.date
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+
+    # restrict to last year (by auction date)
+    if as_of is None:
+        as_of = pd.Timestamp.today().date()
+    start = as_of - timedelta(days=year_window_days)
+    df = df[(df["auction_dt"] >= start) & (df["auction_dt"] <= as_of)].copy()
+
+    # keep only needed rel_days
+    df = df[df["rel_day"].between(-pre_window_days, 0)]
+    if df.empty:
+        return pd.DataFrame(columns=["auction_dt","series_id","entry_rel","entry_date","exit_date","dir","signal","pnl_bp"])
+
+    trades = []
+    for (adt, sid), g in df.groupby(["auction_dt","series_id"]):
+        g = g.sort_values("rel_day").copy()  # ascending: ..., -3,-2,-1,0
+        # need an exit point at T
+        row_T = g[g["rel_day"] == 0]
+        if row_T.empty or pd.isna(row_T[metric_col].iloc[0]):
+            continue
+        box_T = float(row_T[metric_col].iloc[0])
+        date_T = row_T["date"].iloc[0]
+
+        # iterate pre days r: earliest to latest (most negative to -1)
+        entered = False
+        for r in sorted([x for x in g["rel_day"].unique() if x < 0]):
+            cur = g[g["rel_day"] == r]
+            if cur.empty or pd.isna(cur[metric_col].iloc[0]):
+                continue
+            box_r = float(cur[metric_col].iloc[0])
+            date_r = cur["date"].iloc[0]
+
+            # build past window strictly before r, limited to last `roll_len` pre days available
+            past = g[(g["rel_day"] < r) & (g["rel_day"] >= r - roll_len)]
+            past = past.dropna(subset=[metric_col]).sort_values("rel_day")
+            if len(past) < min_past:
+                continue  # not enough past info yet
+
+            mu = past[metric_col].mean()
+            sd = past[metric_col].std(ddof=1)
+
+            if use_zscore:
+                if sd == 0 or np.isnan(sd):
+                    continue
+                signal = (box_r - mu) / sd
+                gate = abs(signal)  # compare to k_bp but now it's "k_sd" in z units
+                thr = k_bp if use_zscore else k_bp
+            else:
+                signal = box_r - mu  # bp
+                gate = abs(signal)
+                thr = k_bp
+
+            if gate >= thr:
+                dirn = np.sign(signal)  # +1 long box, -1 short box
+                pnl_bp = dirn * (box_T - box_r) - tc_bp
+                trades.append({
+                    "auction_dt": adt,
+                    "series_id": sid,
+                    "entry_rel": r,
+                    "entry_date": date_r,
+                    "exit_date": date_T,
+                    "dir": dirn,
+                    "signal": signal,
+                    "entry_level": box_r,
+                    "exit_level": box_T,
+                    "pnl_bp": pnl_bp
+                })
+                entered = True
+                break  # first-touch only
+
+        # if no r triggered, no trade for this auction
+
+    return pd.DataFrame(trades)
+
+# ---- helpers to summarize & plot on calendar time ----
+def summarize_trades(trades: pd.DataFrame) -> pd.Series:
+    if trades.empty:
+        return pd.Series({"N":0,"Hit%":np.nan,"Avg bp":np.nan,"Med bp":np.nan,"Total bp":0.0,"Sharpe":np.nan})
+    t = trades.copy()
+    t["win"] = t["pnl_bp"] > 0
+    return pd.Series({
+        "N": len(t),
+        "Hit%": 100*t["win"].mean(),
+        "Avg bp": t["pnl_bp"].mean(),
+        "Med bp": t["pnl_bp"].median(),
+        "Avg + bp": t.loc[t["pnl_bp"]>0,"pnl_bp"].mean(),
+        "Avg - bp": t.loc[t["pnl_bp"]<=0,"pnl_bp"].mean(),
+        "Total bp": t["pnl_bp"].sum(),
+        "Sharpe": t["pnl_bp"].mean() / (t["pnl_bp"].std(ddof=1)+1e-9),
+    })
+
+def equity_by_exit(trades: pd.DataFrame) -> pd.DataFrame:
+    if trades.empty:
+        return pd.DataFrame(columns=["exit_date","cum_pnl_bp"])
+    d = (trades.groupby("exit_date")["pnl_bp"].sum().sort_index().to_frame("pnl_bp"))
+    d["cum_pnl_bp"] = d["pnl_bp"].cumsum()
+    return d.reset_index()
+
+
+How to run:
+
+# panel must contain: auction_dt, series_id, date, rel_day, box_perbond
+trades = backtest_first_touch_pre_window(panel,
+                                         metric_col="box_perbond",
+                                         pre_window_days=8,
+                                         min_past=3,
+                                         roll_len=5,
+                                         k_bp=2.0,          # or set USE_ZSCORE=True and k_bp=1.0
+                                         use_zscore=False,
+                                         tc_bp=1.0)
+
+summary = summarize_trades(trades)
+curve = equity_by_exit(trades)
+
+print(summary)
+# Plot a step equity vs calendar exit_date
+# plt.step(curve["exit_date"], curve["cum_pnl_bp"], where="post"); ...
+
+What to say in your presentation
+
+“When we extend to an 8-day pre window, we switch to a past-only signal so there’s no look-ahead on early days.
+On each day 
+𝑟
+∈
+[
+−
+8
+,
+−
+1
+]
+r∈[−8,−1] we compare today’s per-bond ASW box to its recent past mean (or z-score).”
+
+“We use a first-touch rule: the earliest day in the window where 
+∣
+signal
+∣
+∣signal∣ exceeds the threshold becomes the entry; we exit at T. One potential trade per auction.”
+
+“P&L is the box change from entry to T (in bp) minus costs; the equity curve is plotted by exit (auction) date, so it’s step-like because we don’t trade every day.”
+
+Variants you can test quickly
+
+Keep baseline T−5 but restrict entries to 
+[
+−
+5
+,
+−
+1
+]
+[−5,−1] (no look-ahead, but a 5-day window, not 8).
+
+Z-score gate (USE_ZSCORE=True): threshold in standard deviations, more robust across regimes.
+
+Scale-in: allow multiple entries (P−6, P−3, …) when signal grows; track each slice separately (same framework).
+
+Post filter: require that the direction at P−1 matches entry direction to avoid whipsaw.
+
+If you tell me your preferred thresholding (absolute bp vs z-score) I can tweak the defaults to match what your desk expects.
+
+You said:
+come up with clever questions to ask about this project so i look smart
+ChatGPT said:
+Thought for 23s
+
+Here’s a punchy set of smart, specific questions you can ask—tailored to your gilt-auction, per-bond ASW-box concession project and the event-driven backtest you built.
+
+Identification & data hygiene
+
+How often would a year-only match pick a different series than our coupon+exact maturity date match, and do those mismatches meaningfully change concession stats?
+
+For auctions missing T−5, is our fallback (last available <0) biasing results vs excluding those auctions?
+
+Are Green gilts behaving differently enough that we should segment them (or exclude them) from conventionals?
+
+Do we validate per-bond boxes by checking beta ≈ 1 and ρ > 0.9 versus the pillar benchmark?
+
+Does using DV01-matched weights instead of linear maturity weights for the benchmark materially change the residuals?
+
+Are we using trading-day alignment consistently across bonds when there are UK holidays vs swap market holidays?
+
+Is when-issued pricing around T materially different from EOD futures/swap closes we use to compute T?
+
+Signal design (economics, not just math)
+
+What’s the clearest economic story: is concession mostly dealer balance-sheet/inventory, client pre-hedging, or macro event proximity?
+
+Should the signal be in bp or z-score to be regime-stable when volatility changes?
+
+Does a P2/P1 combo outperform either alone (e.g., 40/60 blend) after costs?
+
+Is the per-bond ASW box the right RV lens for shorts vs longs or should we use 30s10s for the long bucket and 10s5s for the belly?
+
+Do coupon/ex-div dates, index extensions, or futures rolls contaminate the pre window and need dummies?
+
+Backtest integrity (no look-ahead, no leakage)
+
+In the 8-day pre window, are we strictly using past-only stats (rolling mean/z) for early entries (P−8…P−6)?
+
+Are we assigning P&L on the exit (auction) date to avoid fabricating daily marks?
+
+Do we gate trades by absolute |signal| and also test quantile gating to show stability across thresholds?
+
+Are we doing a time-split (train/test) walk-forward so parameters aren’t tuned in-sample?
+
+Do overlapping auctions ever create concurrent positions? If so, how do we cap or account for correlation?
+
+Have we winsorized or used median metrics so 2022 LDI events don’t dominate averages?
+
+Execution & microstructure
+
+What is a realistic all-in round-trip cost (bp of box) for the DV01-balanced package, and how sensitive is performance to ±0.5 bp?
+
+Do repo specialness or fails around specific lines alter box behavior—should we tag specials and exclude/segment?
+
+Are we better off entering intraday on P1/P2 using a simple VWAP rule vs EOD?
+
+Do new issues vs reopenings carry different concession into T (should we separate)?
+
+Is the stop-loss best set in box bp or by vol-scaled units (e.g., 2σ move)?
+
+What’s the capacity per auction given average street flows—can we size to, say, X% of DV01 without moving the box?
+
+Robustness & regime awareness
+
+How do results change across regimes (QE/QT phases, pre-/post-LDI, high-vol vs low-vol years)?
+
+Do results survive excluding auctions near MPC/CPI/GDP prints?
+
+Are patterns bucket-specific (Short/Mid/Long) or curve-wide after controlling for level/slope/curvature factors?
+
+Does the post-auction reversal (F5−T) remain negative after conditioning on cover ratio and tail?
+
+If we weight by auction size (or expected notional), do conclusions strengthen or weaken?
+
+Risk, capital, and P&L mapping
+
+What DV01 per unit box are we assuming; how does £ P&L per bp translate into VaR and margin for the package?
+
+What is the drawdown profile (max DD, duration) on the calendar-time equity curve—are those clustered around macro events?
+
+Are we diversified across buckets or concentrated in one tenor where capacity/costs might be worse?
+
+Communication & extensions
+
+Can we show confidence intervals on T and F5−T via bootstrap by auction (clustered by bond)?
+
+Would a Bayesian partial-pooling model (across lines/buckets) give tighter uncertainty on mean concession?
+
+Beyond ASW, does a curve-residual in yield deliver similar signals, or are they complementary?
+
+Could we enhance entry with a trend filter (e.g., P3→P2→P1 monotone) to avoid whipsaws?
+
+Pick 6–8 that match your audience (traders vs quants vs PMs). If you tell me who’s in the room, I’ll shortlist and draft one-liners you can use verbatim.
