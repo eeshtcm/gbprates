@@ -1,3 +1,17 @@
+A DataFrame called panel: one row per (auction × trading day) around each auction, with at least:
+
+auction_dt (date), date (trading date), series_id (bond line), rel_day (…−10…0…+10…)
+
+Either:
+
+box_perbond (the per-bond ASW box you want to trade), or
+
+asw_bond and pillar ASWs named asw_2y, asw_5y, asw_7y, asw_10y, asw_15y, asw_20y, asw_30y
+
+You can change pillar names/sets if yours differ.
+
+
+
 import numpy as np
 import pandas as pd
 from datetime import date, timedelta
