@@ -1,0 +1,495 @@
+Strategy: Pre-Auction ASW Box (10y – 2y)
+
+Intuition
+
+In the days before a 10y gilt auction, that sector tends to cheap­en on ASW (its ASW widens) relative to the front end as dealers and RV accounts create balance-sheet room and pre-hedge supply.
+
+Express this relative move with a DV01-matched ASW box: long 10y ASW vs short 2y ASW into the auction; flatten (close) before the bid deadline or on result, depending on your variant.
+
+Instruments
+
+Cash gilts: on-the-run 10y and on-the-run 2y conventionals.
+
+SONIA swaps of matching maturities to create asset-swap packages (ASW):
+
+Long 10y ASW: buy 10y gilt + pay 10y SONIA fixed (receive float).
+
+Short 2y ASW: short 2y gilt + receive 2y SONIA fixed (pay float).
+
+Repo for cash leg; cleared SONIA swaps for swap leg.
+
+The Box
+
+Let ASW_10(t) and ASW_2(t) be par asset-swap spreads (bp).
+
+Define the box spread:
+
+BOX
+10
+−
+2
+(
+𝑡
+)
+=
+ASW
+10
+(
+𝑡
+)
+−
+ASW
+2
+(
+𝑡
+)
+BOX
+10−2
+	​
+
+(t)=ASW
+10
+	​
+
+(t)−ASW
+2
+	​
+
+(t)
+
+In P&L space you must DV01-match notionals so your exposure is to ΔBOX, not the swap curve:
+
+Choose notionals 
+𝑁
+10
+,
+𝑁
+2
+N
+10
+	​
+
+,N
+2
+	​
+
+ such that
+
+𝑁
+10
+⋅
+DV01
+10
+𝑏
+𝑜
+𝑛
+𝑑
+≈
+𝑁
+2
+⋅
+DV01
+2
+𝑏
+𝑜
+𝑛
+𝑑
+N
+10
+	​
+
+⋅DV01
+10
+bond
+	​
+
+≈N
+2
+	​
+
+⋅DV01
+2
+bond
+	​
+
+
+With that match, P&L ≈ 
+(
+Δ
+ASW
+10
+−
+Δ
+ASW
+2
+)
+×
+𝑁
+10
+⋅
+DV01
+10
+𝑏
+𝑜
+𝑛
+𝑑
+=
+Δ
+BOX
+×
+RiskUnit
+(ΔASW
+10
+	​
+
+−ΔASW
+2
+	​
+
+)×N
+10
+	​
+
+⋅DV01
+10
+bond
+	​
+
+=ΔBOX×RiskUnit.
+
+Trade Rules (baseline)
+
+Event universe: all nominal 10y UK DMO auctions. (You can replicate for 5y with 5–2, 30y with 30–10, etc.)
+
+Entry time: T-3 business days at London close (16:30) before the auction date T0.
+(Variants you’ll test: T-5, T-4, T-2, T-1, intraday entry at 15:30, etc.)
+
+Position: Long BOX (long 10y ASW vs short 2y ASW) DV01-matched.
+
+Exit (pick one for backtest):
+
+Pre-result: flatten at T0 09:30–09:55 (before 10:00 bidding deadline) to capture pre-auction concession only; or
+
+On result: flatten at T0 ~10:10–10:30 on result print; or
+
+Fade: hold into T+1 close to capture a first-day mean-reversion leg. (Test separately; don’t mix in the same strategy.)
+
+Filters (recommended)
+
+Skip events where major UK data or BoE is within the holding window (e.g., CPI, labour market, MPC).
+
+Skip if the 10y is switch/syndication-driven in the same window, or if the on-the-run changes (rebucket risk).
+
+Optional liquidity filter: require average bid-ask < X bp, repo specialness within band, or minimum futures volume if you proxy with Gilt future.
+
+Sizing
+
+Target risk per trade: choose a RiskUnit = £ DV01 you’re comfortable with (e.g., £50k/1bp box DV01).
+
+Convert to notionals using the DV01-match above.
+
+Optional dynamic sizing: scale by (expected concession / box vol) using a rolling σ of BOX moves.
+
+Stops & Risk
+
+Hard stop: if BOX moves against you by 1.0–1.5× the rolling 5-day BOX σ before exit, flatten.
+
+Time stop: always flatten by your chosen exit timestamp regardless.
+
+Track basis risks: repo specialness changes, cash-swap funding spread moves, and any CTD/roll if futures proxies are used.
+
+Costs to include
+
+Cash gilt bid-ask (bp of yield ≈ bp of ASW), swap fixed-leg bid-ask (≈0.1–0.2bp), brokerage/clearing, and repo carry for the window. For T-3→T0 this is small but non-zero. Use conservative slippage.
+
+Backtest: step-by-step
+1) Data you need (point-in-time)
+
+Auction calendar: auction dates/times, line ISIN, type (nominal vs linker), size.
+
+Gilts: daily (or intraday) par ASW spreads for on-the-run 10y and 2y (SONIA-based), plus bond DV01 per 100 and accrued.
+
+Swaps: 2y & 10y SONIA par rates (for QA vs vendor ASW if you recompute).
+
+Repo: GC and special rates for both lines (carry/slippage).
+
+Control calendars: macro events (CPI, GDP, MPC, auctions in other buckets).
+
+(If you can’t source ASW directly, you can compute par ASW from price/yield, swap rate and repo; but most desks use the vendor series to avoid model drift.)
+
+2) Event study construction
+
+For each 10y auction e:
+
+Identify entry timestamp t_in(e) and exit timestamp t_out(e) (per your variant).
+
+Compute BOX levels at both timestamps:
+
+BOX
+𝑖
+𝑛
+=
+ASW
+10
+(
+𝑡
+𝑖
+𝑛
+)
+−
+ASW
+2
+(
+𝑡
+𝑖
+𝑛
+)
+,
+BOX
+𝑜
+𝑢
+𝑡
+=
+ASW
+10
+(
+𝑡
+𝑜
+𝑢
+𝑡
+)
+−
+ASW
+2
+(
+𝑡
+𝑜
+𝑢
+𝑡
+)
+BOX
+in
+	​
+
+=ASW
+10
+	​
+
+(t
+in
+	​
+
+)−ASW
+2
+	​
+
+(t
+in
+	​
+
+),BOX
+out
+	​
+
+=ASW
+10
+	​
+
+(t
+out
+	​
+
+)−ASW
+2
+	​
+
+(t
+out
+	​
+
+)
+
+BOX return (bp): 
+Δ
+BOX
+𝑒
+=
+BOX
+𝑜
+𝑢
+𝑡
+−
+BOX
+𝑖
+𝑛
+ΔBOX
+e
+	​
+
+=BOX
+out
+	​
+
+−BOX
+in
+	​
+
+.
+
+Trade P&L (per £100mm notional in the 10y ASW leg):
+
+P&L
+𝑒
+≈
+Δ
+BOX
+𝑒
+×
+DV01
+10
+𝑏
+𝑜
+𝑛
+𝑑
+(
+𝑡
+𝑖
+𝑛
+)
+×
+𝑁
+10
+  
+−
+  
+Costs
+𝑒
+  
++
+  
+Carry
+𝑒
+P&L
+e
+	​
+
+≈ΔBOX
+e
+	​
+
+×DV01
+10
+bond
+	​
+
+(t
+in
+	​
+
+)×N
+10
+	​
+
+−Costs
+e
+	​
+
++Carry
+e
+	​
+
+
+where 
+𝑁
+10
+N
+10
+	​
+
+ is your 10y cash notional (e.g., £100mm), and costs include both legs.
+
+Sign convention
+
+You are long BOX. Profit when ASW10 widens vs ASW2 (ΔBOX > 0) into the auction.
+
+3) Controls, filters, and variants
+
+No-auction control: sample identical windows on non-auction weeks to check that edge is auction-related.
+
+Cross-bucket leakage: if a 2y auction occurs inside your 10y test window, drop or flag the event.
+
+Tenor variants: test 10–5 and 10–30 boxes for the same events; test anchor as an interpolated curve ASW (e.g., linear blend of 2y & 30y) to reduce anchor idiosyncrasy.
+
+Window variants: T-5→T0, T-4→T-1, intraday (e.g., 15:30→09:45 T0).
+
+Exit variants: pre-result vs on-result vs T+1 close. Keep them separate.
+
+4) Statistics to report
+
+Hit rate, avg bp move, bp t-stat of ΔBOX, per-trade P&L (after costs), Sharpe, max DD, ex-ante vs ex-post vol.
+
+Subsamples: pre-2016 vs post-2016 (SONIA transition era), pre-/post-2022 LDI shock, by auction size quartile, by time-since-last-auction in bucket, by macro-quiet vs macro-noisy windows.
+
+Robustness: bootstrap the event distribution (5k resamples) for CI on mean ΔBOX.
+
+Attribution: decompose ΔBOX into ΔASW10 and ΔASW2 legs to confirm the move is from the auction bucket.
+
+5) Implementation gotchas
+
+Point-in-time on-the-run: freeze which ISIN is your 10y/2y at t_in(e) and do not let it roll inside the window.
+
+ASW definition: stick to par ASW vs SONIA for both legs; mixing Z-spread / Libor legacy series will contaminate results.
+
+Funding & specials: if the 10y goes special into supply, repo charges can bite; include a conservative per-day repo adjustment.
+
+Holiday/calendar: use London business days and auction timestamps (DMO bidding normally closes at 10:00 London for gilts).
+
+Transaction costs: stress test with 0.3–0.5bp per ASW leg each way; you’ll be surprised how much it matters at T-3 horizons.
+
+Example parameter set you can present
+
+Bucket: 10y nominal auctions (exclude linkers & syndications).
+
+Box: ASW10 – ASW2, DV01-matched notionals.
+
+Entry: T-3 close; Exit: T0 09:45 (pre-result).
+
+Filters: exclude if CPI/MPC in window; exclude overlapping 2y auctions.
+
+Sizing: aim £50k/1bp risk on the box; hard stop at -1.25σ of 20-day BOX vol.
+
+Costs: 0.4bp round-trip per leg + repo carry.
+
+How you’d actually put it on
+
+Compute DV01s at entry; set notionals so N10×DV01_10 = N2×DV01_2.
+
+Buy the 10y gilt and pay fixed 10y SONIA to lock ASW10.
+
+Short the 2y gilt and receive fixed 2y SONIA to lock ASW2.
+
+Flatten both ASW packages at your exit time. Track BOX move and costs.
+
+Extensions (nice to test if you have time)
+
+Size-aware signal: scale entry only when announced size is top-quartile for that bucket.
+
+Curve-neutral “butterfly box”: replace the 2y anchor with a curve-fitted anchor (e.g., 
+𝑤
+1
+w
+1
+	​
+
+·ASW2 + 
+𝑤
+2
+w
+2
+	​
+
+·ASW30) chosen to minimize historical regression error for ASW10—removes anchor idio risk.
+
+Post-auction fade: separate strategy: go short BOX on result to capture mean reversion T0→T+1/T+3.
+
+Regime switch: only trade when current BOX z-score < 0 (already tight) so there’s room to widen; or the opposite if your sample says “cheap gets cheaper.”
