@@ -493,3 +493,43 @@ w
 Post-auction fade: separate strategy: go short BOX on result to capture mean reversion T0→T+1/T+3.
 
 Regime switch: only trade when current BOX z-score < 0 (already tight) so there’s room to widen; or the opposite if your sample says “cheap gets cheaper.”
+
+
+
+About the strategy itself
+
+Signal robustness – “One thing I’m wondering is: does the concession edge survive if I normalise by volatility or by auction size? Or is it just concentrated in a few big events?”
+→ Shows you care about stability, not just average P&L.
+
+Benchmark choice – “If instead of a 2y anchor I used a curve-fit benchmark, would that remove some of the noise from front-end policy moves? Which do you find more tradable in practice?”
+→ Links your backtest directly to practical structuring.
+
+Scaling – “Given the DV01 in 10y auctions is lumpy, how do you think about sizing this kind of box trade — absolute DV01 vs scaling by expected auction size?”
+→ Connects to real risk budgeting.
+
+About market dynamics
+
+Auction demand shifts – “I tested only pre-auction periods, but in practice how much weight do you put on post-auction mean reversion trades?”
+→ Opens discussion on trading both concession and fade.
+
+LDI / structural flows – “The long-end cheapens earlier than the 10y. Do you think that’s structural (LDI balance-sheet prep) or regime-dependent?”
+→ Shows you’re thinking about why the pattern exists.
+
+Curve linkages – “If BoE policy reprices the 2y massively in the window, would you still trade a 10y–2y box, or would you prefer a curve-neutral butterfly anchor?”
+→ Shows awareness of anchor risk.
+
+About implementation
+
+Execution costs – “My backtest uses vendor ASW mid-quotes. In practice, how wide are the bid-asks in boxes like 10y–2y around auctions? Would that kill a 0.3–0.5bp expected move?”
+→ Pragmatic trading question — good for credibility.
+
+Stop-loss design – “I experimented with a 1.25σ stop. Do you think of risk management on concession trades as volatility-based, or more as a hard limit per auction?”
+→ Shows you’re thinking like risk-managers.
+
+Cross-bucket correlation – “Have you seen concession trades in different buckets (5y vs 10y vs 30y) interact? Is there ever a risk of double-counting if you put them on together?”
+→ Very insightful; links to portfolio view.
+
+About desk perspective
+
+Tradability vs research edge – “From your experience, which matters more for a concession strategy: statistical edge in the backtest, or how easily you can actually put size through in the market?”
+→ Invites them to share trader intuition.
