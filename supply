@@ -1,0 +1,595 @@
+Got it — here’s a single, end-to-end Python script that builds a 10y ASW fair-value model from scratch, using:
+
+Target: 10y ASW = 10y SONIA swap − 10y gilt yield (bps)
+
+Drivers: 10y yield level, GC–SONIA tightness (SONIA − GC, bps), GDP-normalised net duration supply (lagged 1m)
+
+It:
+
+loads raw daily/monthly/quarterly CSVs,
+
+constructs NDS/GDP from DMO issuance, redemptions, and APF sales/purchases (duration-weighted to 10y-equivalents),
+
+builds monthly features,
+
+runs OLS with HAC (Newey–West), prints R²,
+
+produces fair value, residuals, and a simple residual mean-reversion strategy (PnL in bps) with max drawdown and Sharpe.
+
+File schemas (minimal)
+
+dmo_issuance.csv: date, notional_gbp, bucket
+
+dmo_redemptions.csv: date, notional_gbp, bucket
+
+boe_apf_flows.csv: date, notional_gbp, side, bucket (side in {sale,purchase})
+
+ons_nominal_gdp_quarterly.csv: date, nominal_gdp_gbp (quarter-end)
+
+gc_sonia_daily.csv: date, sonia_ond, gc_repo_ond (daily)
+
+yields_daily.csv: date, gilt_10y_yld, swap_10y_yld (daily)
+
+(optional) asw_daily.csv: date, asw_bp (daily). If absent, the script computes ASW as swap − gilt.
+
+The script
+"""
+ASW Fair-Value Model from Scratch
+---------------------------------
+Target: 10y ASW (bps) = 10y SONIA swap - 10y gilt yield
+Drivers:
+  - 10y yield level (bps) [choose gilt or swap]
+  - GC–SONIA tightness (bps) = SONIA_overnight - GC_repo_overnight
+  - GDP-normalised Net Duration Supply (lagged 1m), built from:
+      + DMO issuance (10y-equivalents)
+      + APF active sales/purchases (QT/QE) (10y-equivalents)
+      - Redemptions (10y-equivalents)
+
+Outputs:
+  - OLS(HAC) summary with R^2
+  - Fair value, residuals, z-score
+  - Residual strategy PnL (bps), Sharpe, hit rate, max drawdown (bps)
+  - CSVs with intermediate and final series
+"""
+
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+from statsmodels.stats.sandwich_covariance import cov_hac
+from pathlib import Path
+
+# =========================
+# USER CONFIG
+# =========================
+# Choose yield driver: 'gilt' or 'swap'
+YIELD_DRIVER = 'gilt'
+# How to aggregate GC–SONIA within month: 'mean' | 'eom' | 'pct5' (5th percentile = "tightest")
+TIGHTNESS_SPEC = 'mean'
+
+# 10y duration used for 10y-equivalent scaling
+DUR_10Y = 8.5
+
+# Duration priors by bucket (replace with security-level durations when available)
+DUR_PRIORS = {
+    "short": 4.0, "medium": 9.0, "long": 18.0,
+    "linker_short": 7.0, "linker_long": 20.0
+}
+
+# Residual strategy params
+Z_ENTRY = 1.0      # enter when |z| >= 1.0
+Z_EXIT  = 0.0      # exit when z crosses 0
+VOL_WIN = 6        # months for vol estimate
+TARGET_RISK = 1.0  # arbitrary unit; sizing ∝ 1/vol
+SIZE_CAP = 3.0     # cap risk-parity size
+COST_PER_CHANGE_BP = 0.2  # cost per position change (bps)
+
+# OoS settings
+OOS_TRAIN_MONTHS = 60  # start OoS after 5y of monthly data
+HAC_LAGS = 3           # Newey-West lags (months)
+
+# Input file paths (adjust these)
+paths = {
+    "issuance": "dmo_issuance.csv",
+    "redemptions": "dmo_redemptions.csv",
+    "apf": "boe_apf_flows.csv",
+    "gdp": "ons_nominal_gdp_quarterly.csv",
+    "gcsonia": "gc_sonia_daily.csv",
+    "yields": "yields_daily.csv",
+    # optional: if missing, ASW is computed as swap - gilt
+    "asw_daily": "asw_daily.csv",
+}
+
+# =========================
+# HELPERS
+# =========================
+def ensure_bps(series: pd.Series) -> pd.Series:
+    """Convert a rate series to basis points.
+       Heuristic:
+         - If median < 0.5 -> treat as decimal (0.045 = 4.5%) => *1e4
+         - Else if median < 50 -> treat as percent (4.5 = 4.5%) => *100
+         - Else already in bps
+    """
+    s = series.astype(float).copy()
+    med = s.dropna().abs().median()
+    if med < 0.5:
+        return s * 1e4
+    elif med < 50:
+        return s * 100
+    return s
+
+def map_duration(bucket: str) -> float:
+    b = str(bucket).lower()
+    if "link" in b and any(k in b for k in ["ultra", "long", "15", "20", "30"]):
+        return DUR_PRIORS["linker_long"]
+    if "link" in b:
+        return DUR_PRIORS["linker_short"]
+    if "short" in b:
+        return DUR_PRIORS["short"]
+    if "medium" in b or "med" in b:
+        return DUR_PRIORS["medium"]
+    if "long" in b:
+        return DUR_PRIORS["long"]
+    return DUR_PRIORS["medium"]
+
+def df_exists(path_key: str) -> bool:
+    p = Path(paths[path_key])
+    return p.exists() and p.is_file()
+
+# =========================
+# 1) BUILD NDS/GDP (monthly)
+# =========================
+def build_nds_over_gdp_monthly() -> pd.DataFrame:
+    # Load flows
+    iss = pd.read_csv(paths["issuance"], parse_dates=["date"])
+    red = pd.read_csv(paths["redemptions"], parse_dates=["date"])
+    apf = pd.read_csv(paths["apf"], parse_dates=["date"])
+    for d in (iss, red, apf):
+        d["bucket"] = d["bucket"].astype(str)
+
+    # 10y-equivalents
+    for d in (iss, red, apf):
+        d["dur"] = d["bucket"].apply(map_duration)
+        d["ten_eq"] = d["notional_gbp"] * (d["dur"] / DUR_10Y)
+
+    # Signed flows
+    iss["signed_10yeq"] = iss["ten_eq"]         # + issuance
+    red["signed_10yeq"] = -red["ten_eq"]        # - redemptions
+    apf["side"] = apf["side"].str.lower()
+    apf["signed_10yeq"] = apf["ten_eq"] * apf["side"].map(
+        {"sale": +1, "sell": +1, "purchase": -1, "buy": -1}
+    )
+
+    # Monthly aggregation
+    iss_m = iss.set_index("date").resample("M")["signed_10yeq"].sum().rename("iss_10yeq")
+    red_m = red.set_index("date").resample("M")["signed_10yeq"].sum().rename("red_10yeq")
+    apf_m = apf.set_index("date").resample("M")["signed_10yeq"].sum().rename("apf_10yeq")
+
+    flows = pd.concat([iss_m, red_m, apf_m], axis=1).fillna(0.0)
+    flows["NDS_10yeq"] = flows.sum(axis=1)
+
+    # GDP (quarterly -> monthly)
+    gdp_q = pd.read_csv(paths["gdp"], parse_dates=["date"]).set_index("date").sort_index()
+    gdp_m = gdp_q.resample("M").interpolate("linear").ffill().rename(
+        columns={"nominal_gdp_gbp": "GDP_nominal"}
+    )
+
+    nds = flows.join(gdp_m, how="inner")
+    nds["NDS_over_GDP"] = nds["NDS_10yeq"] / nds["GDP_nominal"]
+    nds["NDS_over_GDP_l1"] = nds["NDS_over_GDP"].shift(1)
+
+    nds.to_csv("build_nds_over_gdp_monthly.csv")
+    return nds[["NDS_over_GDP_l1"]]
+
+# =========================
+# 2) GC–SONIA tightness (monthly)
+# =========================
+def build_gc_sonia_tightness_monthly() -> pd.DataFrame:
+    gc = pd.read_csv(paths["gcsonia"], parse_dates=["date"]).set_index("date").sort_index()
+    # Convert to bps
+    gc["sonia_ond_bp"] = ensure_bps(gc["sonia_ond"])
+    gc["gc_repo_ond_bp"] = ensure_bps(gc["gc_repo_ond"])
+    # Tightness = SONIA - GC (higher => tighter collateral)
+    gc["tightness_bp"] = gc["sonia_ond_bp"] - gc["gc_repo_ond_bp"]
+
+    if TIGHTNESS_SPEC == 'eom':
+        gc_m = gc["tightness_bp"].resample("M").last().to_frame()
+    elif TIGHTNESS_SPEC == 'pct5':
+        gc_m = gc["tightness_bp"].resample("M").quantile(0.05).to_frame()
+    else:
+        gc_m = gc["tightness_bp"].resample("M").mean().to_frame()
+
+    gc_m.to_csv("build_gc_sonia_tightness_monthly.csv")
+    return gc_m
+
+# =========================
+# 3) 10y yields & ASW (monthly)
+# =========================
+def build_yields_and_asw_monthly() -> pd.DataFrame:
+    yld = pd.read_csv(paths["yields"], parse_dates=["date"]).set_index("date").sort_index()
+    yld["gilt_10y_yld_bp"] = ensure_bps(yld["gilt_10y_yld"])
+    yld["swap_10y_yld_bp"] = ensure_bps(yld["swap_10y_yld"])
+
+    # ASW: use provided daily if exists; else compute swap - gilt
+    if df_exists("asw_daily"):
+        asw = pd.read_csv(paths["asw_daily"], parse_dates=["date"]).set_index("date").sort_index()
+        asw_m = asw["asw_bp"].resample("M").mean().to_frame("asw_bp")
+    else:
+        yld["asw_bp"] = yld["swap_10y_yld_bp"] - yld["gilt_10y_yld_bp"]
+        asw_m = yld["asw_bp"].resample("M").mean().to_frame()
+
+    yld_m = yld[["gilt_10y_yld_bp", "swap_10y_yld_bp"]].resample("M").mean()
+
+    # Choose driver
+    if YIELD_DRIVER == 'gilt':
+        yld_m = yld_m.rename(columns={"gilt_10y_yld_bp":"yld_10y_bp"})[["yld_10y_bp"]]
+    else:
+        yld_m = yld_m.rename(columns={"swap_10y_yld_bp":"yld_10y_bp"})[["yld_10y_bp"]]
+
+    out = asw_m.join(yld_m, how="inner")
+    out.to_csv("build_yields_and_asw_monthly.csv")
+    return out
+
+# =========================
+# 4) Regression + residual strategy
+# =========================
+def run_regression_and_strategy(df_monthly: pd.DataFrame) -> pd.DataFrame:
+    """
+    df_monthly columns:
+      - asw_bp
+      - yld_10y_bp
+      - tightness_bp
+      - NDS_over_GDP_l1
+    Index: month-end timestamps
+    """
+    df = df_monthly.dropna().copy()
+
+    y = df["asw_bp"]
+    X = sm.add_constant(df[["yld_10y_bp","tightness_bp","NDS_over_GDP_l1"]])
+
+    ols = sm.OLS(y, X).fit()
+    cov = cov_hac(ols, maxlags=HAC_LAGS)
+    ols_hac = ols.get_robustcov_results(cov_type='HAC', cov_kwds={'maxlags':HAC_LAGS})
+
+    print(ols_hac.summary())
+    print("In-sample R^2:", round(ols.rsquared, 3))
+
+    # Fair value & residual
+    df["fair_value_bp"]   = ols.predict(X)
+    df["resid_bp"]        = df["asw_bp"] - df["fair_value_bp"]
+
+    # Expanding OoS R^2
+    oos_preds = []
+    idx = df.index
+    for i in range(OOS_TRAIN_MONTHS, len(df)):
+        y_tr = y.iloc[:i]
+        X_tr = X.iloc[:i]
+        m = sm.OLS(y_tr, X_tr).fit()
+        oos_preds.append(m.predict(X.iloc[i:i+1]).iloc[0])
+    df.loc[idx[OOS_TRAIN_MONTHS]:, "fv_oos_bp"] = oos_preds
+    df["oos_err2"] = (df["asw_bp"] - df["fv_oos_bp"])**2
+    df["ins_err2"] = (df["asw_bp"] - df["fair_value_bp"])**2
+    oos_r2 = 1 - df["oos_err2"].sum() / ((df["asw_bp"] - df["asw_bp"].mean())**2).sum()
+    print("Out-of-sample R^2 (expanding):", round(oos_r2, 3))
+
+    # Residual z-score
+    win = 24
+    df["resid_mu"] = df["resid_bp"].rolling(win).mean()
+    df["resid_sd"] = df["resid_bp"].rolling(win).std()
+    df["zscore"] = (df["resid_bp"] - df["resid_mu"]) / df["resid_sd"]
+
+    # Signal construction
+    def signal_from_z(z, pos):
+        # enter when |z| >= Z_ENTRY; exit when cross 0
+        if pos == 0:
+            if z >= Z_ENTRY:  return -1
+            if z <= -Z_ENTRY: return +1
+            return 0
+        else:
+            if (pos == +1 and z >= Z_EXIT) or (pos == -1 and z <= -Z_EXIT):
+                return 0
+            return pos
+
+    df["sig"] = 0
+    pos = 0
+    for i, z in enumerate(df["zscore"].fillna(0.0)):
+        pos = signal_from_z(z, pos)
+        df.iloc[i, df.columns.get_loc("sig")] = pos
+
+    # Risk-parity sizing
+    df["d_asw"] = df["asw_bp"].diff()
+    df["vol_bp"] = df["d_asw"].rolling(VOL_WIN).std()
+    df["size"] = (TARGET_RISK / df["vol_bp"]).clip(upper=SIZE_CAP).fillna(0.0)
+
+    # Turnover & costs
+    turnover = df["sig"].diff().abs().fillna(0.0)
+    df["cost_bp"] = turnover * COST_PER_CHANGE_BP
+
+    # PnL (bps): position at t applies to change t->t+1
+    df["pnl_bp"] = (df["sig"].shift(1) * df["size"].shift(1) * df["d_asw"]) - df["cost_bp"]
+    df["pnl_bp"] = df["pnl_bp"].fillna(0.0)
+    df["cum_pnl_bp"] = df["pnl_bp"].cumsum()
+
+    # Max drawdown (bps)
+    cum = df["cum_pnl_bp"]
+    peak = cum.cummax()
+    draw = peak - cum
+    max_dd_bp = float(draw.max())
+    print("Max drawdown (bps):", round(max_dd_bp, 1))
+
+    # Sharpe, hit rate
+    ann = 12
+    mu_m = df["pnl_bp"].mean()
+    sd_m = df["pnl_bp"].std()
+    sharpe = (mu_m / sd_m) * np.sqrt(ann) if sd_m > 0 else np.nan
+    hit = (df["pnl_bp"] > 0).mean()
+    print(f"Sharpe (ann.): {sharpe:.2f}, Hit rate: {hit:.2%}, Avg monthly PnL (bp): {mu_m:.2f}")
+
+    df.to_csv("asw_fair_value_and_strategy_output.csv")
+    return df
+
+# =========================
+# MAIN PIPELINE
+# =========================
+def main():
+    nds = build_nds_over_gdp_monthly()                   # NDS_over_GDP_l1
+    tight = build_gc_sonia_tightness_monthly()           # tightness_bp
+    y_asw = build_yields_and_asw_monthly()               # asw_bp & yld_10y_bp
+    monthly = y_asw.join(tight, how="inner").join(nds, how="inner")
+    monthly.to_csv("fv_driver_panel_monthly.csv")
+    results = run_regression_and_strategy(monthly)
+    print("\nSaved files:")
+    print(" - fv_driver_panel_monthly.csv")
+    print(" - asw_fair_value_and_strategy_output.csv")
+    print(" - build_nds_over_gdp_monthly.csv")
+    print(" - build_gc_sonia_tightness_monthly.csv")
+    print(" - build_yields_and_asw_monthly.csv")
+
+if __name__ == "__main__":
+    main()
+
+How to use
+
+Save the script (e.g., asw_fair_value_from_scratch.py) in a folder with your CSVs.
+
+Update the paths dict if your filenames differ.
+
+Choose YIELD_DRIVER ('gilt' or 'swap') and TIGHTNESS_SPEC ('mean', 'eom', or 'pct5').
+
+Run it. It will emit:
+
+fv_driver_panel_monthly.csv (the monthly dataset used)
+
+asw_fair_value_and_strategy_output.csv (FV, residual, z-score, signals, PnL)
+
+Intermediates for auditing.
+
+If you want me to tailor the bucket mapping, add BoE sale bucket dummies, or switch to weekly frequency, I can fold that straight into this template.
+
+You said:
+
+runs **OLS with HAC (Newey–West)**, prints **R²**,
+
+what is this? when i sau r^2 i mean from a linear regression
+ChatGPT said:
+
+Right — no need to over-complicate it. When the trader said “run a regression and check the 
+𝑅
+2
+R
+2
+,” they meant exactly this:
+
+Take your dependent variable = the 10-year spread (in practice, the 10y gilt ASW = 10y SONIA swap – 10y gilt yield, in bps).
+
+Regress it linearly on your explanatory variables:
+
+the 10-year yield level (bps)
+
+GC–SONIA tightness (bps)
+
+GDP-normalised net duration supply (lagged 1 period, unitless)
+
+So the regression is just:
+
+ASW
+𝑡
+10
+𝑦
+=
+𝛼
++
+𝛽
+1
+⋅
+Yield
+𝑡
+10
+𝑦
++
+𝛽
+2
+⋅
+(
+SONIA
+−
+GC
+)
+𝑡
++
+𝛽
+3
+⋅
+NDS/GDP
+𝑡
+−
+1
++
+𝜀
+𝑡
+ASW
+t
+10y
+	​
+
+=α+β
+1
+	​
+
+⋅Yield
+t
+10y
+	​
+
++β
+2
+	​
+
+⋅(SONIA−GC)
+t
+	​
+
++β
+3
+	​
+
+⋅NDS/GDP
+t−1
+	​
+
++ε
+t
+	​
+
+
+You estimate this with ordinary least squares (OLS).
+
+The regression output gives you:
+
+coefficients 
+𝛽
+^
+𝑖
+β
+^
+	​
+
+i
+	​
+
+ (with signs/t-stats),
+
+the 
+𝑅
+2
+R
+2
+ (the share of variation in ASW explained by these drivers).
+
+That 
+𝑅
+2
+R
+2
+ is exactly what the trader is asking for — “does this model have explanatory power?”
+
+Why I mentioned HAC before
+
+In finance time-series, errors are often autocorrelated/heteroskedastic. If you want more robust t-stats, you use Newey-West. But the 
+𝑅
+2
+R
+2
+ itself is just the ordinary regression 
+𝑅
+2
+R
+2
+ — no difference.
+
+👉 Do you want me to show you a minimal Python example with dummy data so you see exactly how to run this regression and read off the 
+𝑅
+2
+R
+2
+? That way you’ll have a clean starting point before wiring in DMO, BoE, and GC–SONIA data.
+
+You said:
+ok now just explain everything the model is doing in the most basic terms and ask some questions on it so i look like i made progress
+ChatGPT said:
+
+Perfect — here’s how to frame your progress in really simple terms and the kinds of smart questions you can ask back to the trader.
+
+🚦 What the model is doing (basic terms)
+
+Target (what we want to explain):
+The 10-year gilt spread (usually the asset swap spread = 10y SONIA swap – 10y gilt yield). Traders care because it shows whether gilts are cheap/rich relative to swaps.
+
+Drivers (the things we think move it):
+
+10y yield level: the overall level of rates. When yields are high, investor demand and hedging dynamics change.
+
+GC–SONIA (repo tightness): shows how scarce gilts are as collateral. If gilts are in high demand for repo, spreads widen.
+
+Net duration supply, scaled by GDP: the amount of government bond risk the market has to absorb (new issuance, QT sales, minus redemptions). More supply per GDP usually cheapens gilts, widening spreads.
+
+The regression:
+We run a simple line fit (OLS regression). It finds the best combination of the three drivers that explains how the 10y spread has actually moved in the past.
+
+The 
+𝑅
+2
+R
+2
+:
+This number tells us how much of the variation in spreads is explained by these drivers.
+
+An 
+𝑅
+2
+R
+2
+ close to 1 = very good fit.
+
+An 
+𝑅
+2
+R
+2
+ close to 0 = poor fit.
+
+The residual:
+That’s the bit the model can’t explain. Traders use it as a signal:
+
+If the spread is wider than the model says (positive residual) → gilts look cheap → maybe a short-term buy.
+
+If the spread is tighter than the model says (negative residual) → gilts look rich → maybe a short-term sell.
+
+❓ Questions you can ask to look like you’ve pushed it forward
+
+On the target variable:
+
+“Should I define the 10y spread as a true asset swap spread (including repo), or is swap minus gilt yield enough for this analysis?”
+
+On GC–SONIA:
+
+“Do you prefer I use the monthly average GC–SONIA, or should I focus on the most extreme/tightest day of the month, since specials drive ASWs?”
+
+On supply:
+
+“For net duration supply, should I weight linkers differently, or just approximate with simple duration buckets?”
+
+On regression design:
+
+“Should I include contemporaneous supply, or lag it by one month to avoid look-ahead bias?”
+
+“Are there other control variables (like curve slope or volatility) that you’d expect to matter?”
+
+On trading the residual:
+
+“Would you size positions on the z-score of the residual, or use it more qualitatively as context?”
+
+“How big a deviation from fair value would you usually need before putting risk on?”
+
+👉 This way, you can go back and say: “I’ve set up a regression where ASW is explained by 10y yields, GC–SONIA, and net duration supply/GDP. The idea is that the model gives a fair value and the residual is a trading signal. I’m now working out whether to use average vs extreme repo spreads, how to bucket linker supply, and how best to treat lags.”
+
+That shows clear progress and invites the trader into the discussion.
